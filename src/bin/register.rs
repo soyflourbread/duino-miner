@@ -10,7 +10,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 
 #[derive(Clap)]
-#[clap(version = "0.0", author = "Black H. <encomblackhat@gmail.com>")]
+#[clap(version = "0.1", author = "Black H. <encomblackhat@gmail.com>")]
 #[clap(setting = AppSettings::ColoredHelp)]
 struct Opts {
     #[clap(short, long, default_value = "51.15.127.80")]
