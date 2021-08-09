@@ -8,6 +8,8 @@ use tokio::net::TcpStream;
 use tokio::io::{AsyncWriteExt, AsyncReadExt};
 use tokio::fs::File;
 
+use log::{info, warn, error};
+
 use sha1::{Sha1, Digest};
 use rand::Rng;
 
@@ -15,7 +17,7 @@ use clap::{AppSettings, Clap, Subcommand};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Config {
-    pub devices: Vec<Device>
+    pub devices: Vec<Device>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -58,13 +60,13 @@ struct Generate {
     username: String,
     #[clap(long, default_value = "16")]
     device_count: u32,
-    #[clap(long, default_value = "esp-")]
+    #[clap(long, default_value = "avr-")]
     device_name_prefix: String,
-    #[clap(long, default_value = "ESP8266")]
+    #[clap(long, default_value = "AVR")]
     device_type: String,
-    #[clap(long, default_value = "ESP8266 Miner v2.55")]
+    #[clap(long, default_value = "Official AVR Miner v2.6")]
     firmware: String,
-    #[clap(long, default_value = "9200")]
+    #[clap(long, default_value = "190")]
     target_rate: u32,
 }
 
@@ -72,12 +74,12 @@ struct Generate {
 struct Run {}
 
 
-fn generate_5hex() -> String {
+fn generate_8hex() -> String {
     const HEX_ARRAY: [char; 16] = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f'];
 
     let mut result = String::new();
 
-    for _ in 0..5 {
+    for _ in 0..8 {
         let n: usize = rand::thread_rng().gen_range(0..16);
         result.push(HEX_ARRAY[n]);
     }
@@ -95,7 +97,7 @@ async fn generate_config(file_path: String, gen: &Generate) -> Result<(), Box<dy
             username: gen.username.clone(),
             device_name: format!("{}{}", gen.device_name_prefix, i + 1),
             device_type: gen.device_type.clone(),
-            chip_id: generate_5hex(),
+            chip_id: format!("DUCOID{}", generate_8hex()),
             firmware: gen.firmware.clone(),
             target_rate: gen.target_rate,
         };
@@ -127,11 +129,11 @@ async fn start_miner(device: Device) -> Result<(), MinerError> {
     let mut stream = TcpStream::connect(
         format!("{}:{}", device.host, device.port)).await.map_err(|_| MinerError::Connection)?;
 
-    // println!("{} connected to pool {}:{}", device.device_name, device.host, device.port);
+    info!("{} connected to pool {}:{}", device.device_name, device.host, device.port);
 
     let mut cmd_in: [u8; 200] = [0; 200];
     let n = stream.read(&mut cmd_in).await.map_err(|_| MinerError::RecvCommand)?;
-    // println!("version: {}", std::str::from_utf8(&cmd_in[..n])?);
+    info!("version: {}", std::str::from_utf8(&cmd_in[..n]).map_err(|_| MinerError::InvalidUTF8)?);
 
     let expected_interval = 1000000u128 / device.target_rate as u128;
 
@@ -151,7 +153,7 @@ async fn start_miner(device: Device) -> Result<(), MinerError> {
         let expected_hash = args[1];
         let diff = args[2].parse::<u32>().map_err(|_| MinerError::MalformedJob(job.to_string()))? * 100 + 1;
 
-        // println!("last: {}, expected: {}, diff: {}", last_block_hash, expected_hash, diff);
+        info!("last: {}, expected: {}, diff: {}", last_block_hash, expected_hash, diff);
 
         let start = SystemTime::now();
 
@@ -167,14 +169,20 @@ async fn start_miner(device: Device) -> Result<(), MinerError> {
                 let expected_duration = expected_interval * duco_numeric_result as u128;
 
                 if duration < expected_duration {
-                    tokio::time::sleep(Duration::from_micros(
-                        (expected_duration - duration) as u64)).await;
-                    // println!("Waited {} micro sec", expected_duration - duration);
+                    let wait_multiplier: u64 = rand::thread_rng().gen_range(95..105);
+                    let wait_duration = (expected_duration - duration) as u64 * wait_multiplier / 100;
+                    tokio::time::sleep(Duration::from_micros(wait_duration)).await;
+                    info!("Waited {} micro sec", wait_duration);
+                } else {
+                    warn!("system too slow, lag {} micro sec", duration - expected_duration);
                 }
 
                 let end = SystemTime::now();
                 let duration = end.duration_since(start).unwrap().as_micros();
                 let emu_rate = duco_numeric_result as f64 / duration as f64 * 1000000f64;
+
+                let lag_duration: u64 = rand::thread_rng().gen_range(0..100);
+                tokio::time::sleep(Duration::from_millis(lag_duration)).await;
 
                 let cmd_out = format!("{},{:.2},{},{},{}\n",
                                       duco_numeric_result, emu_rate, device.firmware, device.device_name, device.chip_id);
@@ -183,11 +191,12 @@ async fn start_miner(device: Device) -> Result<(), MinerError> {
                 let n = stream.read(&mut cmd_in).await.map_err(|_| MinerError::RecvCommand)?;
                 let resp = std::str::from_utf8(&cmd_in[..n]).map_err(|_| MinerError::InvalidUTF8)?.trim();
 
-                // println!("resp: {}, result: {}, rate: {:.2}, real: {:.2}",
-                //          resp, duco_numeric_result, emu_rate, real_rate);
                 if resp != "GOOD" {
-                    println!("resp: {}, result: {}, rate: {:.2}, real: {:.2}",
+                    warn!("resp: {}, result: {}, rate: {:.2}, real: {:.2}",
                              resp, duco_numeric_result, emu_rate, real_rate);
+                } else {
+                    info!("resp: {}, result: {}, rate: {:.2}, real: {:.2}",
+                          resp, duco_numeric_result, emu_rate, real_rate);
                 }
 
                 break;
@@ -211,6 +220,8 @@ async fn start_miners(devices: Vec<Device>) -> Result<(), MinerError> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    pretty_env_logger::init();
+
     let opts: Opts = Opts::parse();
 
     match opts.sub_command {
@@ -221,13 +232,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let c_serial = tokio::fs::read_to_string(opts.config_file).await?;
             let c: Config = serde_yaml::from_str(c_serial.as_str())?;
 
-            println!("Running with {} miners", c.devices.len());
+            info!("Running with {} miners", c.devices.len());
 
             loop {
                 match start_miners(c.devices.clone()).await {
                     Ok(_) => break,
                     Err(e) => {
-                        println!("Exited with error: {:?}", e);
+                        error!("Exited with error: {:?}", e);
                         tokio::time::sleep(Duration::from_secs(300u64)).await;
                     }
                 }
