@@ -17,7 +17,7 @@ cargo build --release
 To generate a config file for the miner, execute
 
 ```sh
-duino-miner generate -u my_username --device-type=AVR --firmware="Official AVR Miner v2.6" --device-name-prefix "avr-" --target-rate 182
+duino-miner generate -u my_username --device-name-prefix "avr-" --target-rate 182
 ```
 
 To run the miner from your config file, execute
