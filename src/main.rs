@@ -123,9 +123,6 @@ fn sha1_digest(input: &str) -> String {
 }
 
 async fn start_miner(device: Device) -> Result<(), MinerError> {
-    let heatup_duration: u64 = rand::thread_rng().gen_range(0..10000);
-    tokio::time::sleep(Duration::from_millis(heatup_duration)).await;
-
     let mut stream = TcpStream::connect(
         format!("{}:{}", device.host, device.port)).await.map_err(|_| MinerError::Connection)?;
 
@@ -169,10 +166,9 @@ async fn start_miner(device: Device) -> Result<(), MinerError> {
                 let expected_duration = expected_interval * duco_numeric_result as u128;
 
                 if duration < expected_duration {
-                    let wait_multiplier: u64 = rand::thread_rng().gen_range(95..105);
-                    let wait_duration = (expected_duration - duration) as u64 * wait_multiplier / 100;
+                    let wait_duration = (expected_duration - duration) as u64;
                     tokio::time::sleep(Duration::from_micros(wait_duration)).await;
-                    info!("Waited {} micro sec", wait_duration);
+                    info!("waited {} micro sec", wait_duration);
                 } else {
                     warn!("system too slow, lag {} micro sec", duration - expected_duration);
                 }
@@ -191,12 +187,15 @@ async fn start_miner(device: Device) -> Result<(), MinerError> {
                 let n = stream.read(&mut cmd_in).await.map_err(|_| MinerError::RecvCommand)?;
                 let resp = std::str::from_utf8(&cmd_in[..n]).map_err(|_| MinerError::InvalidUTF8)?.trim();
 
-                if resp != "GOOD" {
+                if resp == "GOOD" {
+                    info!("result good, result: {}, rate: {:.2}, real: {:.2}",
+                          duco_numeric_result, emu_rate, real_rate);
+                } else if resp == "BLOCK" {
+                    info!("FOUND BLOCK!, result: {}, rate: {:.2}, real: {:.2}",
+                             duco_numeric_result, emu_rate, real_rate);
+                } else {
                     warn!("resp: {}, result: {}, rate: {:.2}, real: {:.2}",
                              resp, duco_numeric_result, emu_rate, real_rate);
-                } else {
-                    info!("resp: {}, result: {}, rate: {:.2}, real: {:.2}",
-                          resp, duco_numeric_result, emu_rate, real_rate);
                 }
 
                 break;
@@ -205,17 +204,30 @@ async fn start_miner(device: Device) -> Result<(), MinerError> {
     }
 }
 
-async fn start_miners(devices: Vec<Device>) -> Result<(), MinerError> {
+async fn start_miner_with_watchdog(device: Device) {
+    loop {
+        let heatup_duration: u64 = rand::thread_rng().gen_range(0..10000);
+        tokio::time::sleep(Duration::from_millis(heatup_duration)).await;
+
+        match start_miner(device.clone()).await {
+            Ok(_) => error!("exited without error"),
+            Err(e) => error!("exited with error: {:?}", e),
+        }
+
+        let hiatus_duration: u64 = rand::thread_rng().gen_range(30..200);
+        tokio::time::sleep(Duration::from_secs(hiatus_duration)).await;
+    }
+}
+
+async fn start_miners(devices: Vec<Device>) {
     let mut futures_vec = Vec::new();
 
     for device in devices {
-        let f = start_miner(device);
+        let f = start_miner_with_watchdog(device);
         futures_vec.push(f);
     }
 
-    futures::future::try_join_all(futures_vec).await?;
-
-    Ok(())
+    futures::future::join_all(futures_vec).await;
 }
 
 #[tokio::main]
@@ -232,17 +244,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let c_serial = tokio::fs::read_to_string(opts.config_file).await?;
             let c: Config = serde_yaml::from_str(c_serial.as_str())?;
 
-            info!("Running with {} miners", c.devices.len());
+            info!("running with {} miners", c.devices.len());
 
-            loop {
-                match start_miners(c.devices.clone()).await {
-                    Ok(_) => break,
-                    Err(e) => {
-                        error!("Exited with error: {:?}", e);
-                        tokio::time::sleep(Duration::from_secs(300u64)).await;
-                    }
-                }
-            }
+            start_miners(c.devices).await;
         }
     }
 
