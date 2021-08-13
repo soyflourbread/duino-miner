@@ -39,21 +39,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let c_serial = tokio::fs::read_to_string(opts.config_file).await?;
     let c: Config = serde_yaml::from_str(c_serial.as_str())?;
 
+    let mut stream = TcpStream::connect(
+        format!("{}:{}", c.host, c.port)).await.map_err(|_| MinerError::Connection)?;
+
+    println!("Connected to pool {}:{}", c.host, c.port);
+
+    let mut cmd_in: [u8; 200] = [0; 200];
+    let n = stream.read(&mut cmd_in).await.map_err(|_| MinerError::RecvCommand)?;
+    println!("version: {}", std::str::from_utf8(&cmd_in[..n])?);
+
     for account in c.accounts {
-        if account.username == c.main_account {
-            continue;
-        }
-
-        let mut stream = TcpStream::connect(
-            format!("{}:{}", c.host, c.port)).await.map_err(|_| MinerError::Connection)?;
-
-        println!("Connected to pool {}:{}", c.host, c.port);
-
-        let mut cmd_in: [u8; 200] = [0; 200];
-
-        let n = stream.read(&mut cmd_in).await.map_err(|_| MinerError::RecvCommand)?;
-        println!("version: {}", std::str::from_utf8(&cmd_in[..n])?);
-
         let cmd_job = format!("LOGI,{},{}\n", account.username, account.password);
         stream.write(cmd_job.as_bytes()).await.map_err(|_| MinerError::SendCommand)?;
         let n = stream.read(&mut cmd_in).await.map_err(|_| MinerError::RecvCommand)?;
@@ -68,6 +63,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let n = stream.read(&mut cmd_in).await.map_err(|_| MinerError::RecvCommand)?;
         let balance: f32 = std::str::from_utf8(&cmd_in[..n]).map_err(|_| MinerError::InvalidUTF8)?.parse()?;
         println!("account {} has balance {}", account.username, balance);
+
+        if account.username == c.main_account {
+            continue;
+        }
 
         let balance = balance as u32;
 
