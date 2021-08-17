@@ -72,7 +72,10 @@ struct Generate {
 }
 
 #[derive(Clap)]
-struct Run {}
+struct Run {
+    #[clap(short, long)]
+    pool: Option<String>,
+}
 
 fn generate_8hex() -> String {
     const HEX_ARRAY: [char; 16] = [
@@ -138,17 +141,15 @@ async fn get_pool_info() -> Result<Pool, MinerError> {
     Ok(pool)
 }
 
-async fn start_miner(device: Device) -> Result<(), MinerError> {
-    let pool = get_pool_info().await?;
+async fn start_miner(device: Device, pool: String) -> Result<(), MinerError> {
+    let heatup_duration: u64 = rand::thread_rng().gen_range(10..10000);
+    tokio::time::sleep(Duration::from_millis(heatup_duration)).await;
 
-    let mut stream = TcpStream::connect(format!("{}:{}", pool.ip, pool.port))
+    let mut stream = TcpStream::connect(&pool)
         .await
         .map_err(|_| MinerError::Connection)?;
 
-    info!(
-        "{} connected to pool {}:{}",
-        device.device_name, pool.ip, pool.port
-    );
+    info!("{} connected to pool {}", device.device_name, pool);
 
     let mut cmd_in: [u8; 200] = [0; 200];
     let n = stream
@@ -270,12 +271,29 @@ async fn start_miner(device: Device) -> Result<(), MinerError> {
     }
 }
 
-async fn start_miner_with_watchdog(device: Device) {
+async fn start_miners(devices: Vec<Device>, pool: Option<String>) {
     loop {
-        let heatup_duration: u64 = rand::thread_rng().gen_range(0..10000);
-        tokio::time::sleep(Duration::from_millis(heatup_duration)).await;
+        let pool = if let Some(pool) = pool.clone() {
+            pool
+        } else {
+            let pool = get_pool_info().await.unwrap_or(Pool {
+                name: "Default pool".to_string(),
+                ip: "server.duinocoin.com".to_string(),
+                port: 2813,
+                connections: 1,
+            });
 
-        match start_miner(device.clone()).await {
+            format!("{}:{}", pool.ip, pool.port)
+        };
+
+        let mut futures_vec = Vec::new();
+
+        for device in &devices {
+            let f = start_miner(device.clone(), pool.clone());
+            futures_vec.push(f);
+        }
+
+        match futures::future::try_join_all(futures_vec).await {
             Ok(_) => error!("exited without error"),
             Err(e) => error!("exited with error: {:?}", e),
         }
@@ -283,17 +301,6 @@ async fn start_miner_with_watchdog(device: Device) {
         let hiatus_duration: u64 = rand::thread_rng().gen_range(30..200);
         tokio::time::sleep(Duration::from_secs(hiatus_duration)).await;
     }
-}
-
-async fn start_miners(devices: Vec<Device>) {
-    let mut futures_vec = Vec::new();
-
-    for device in devices {
-        let f = start_miner_with_watchdog(device);
-        futures_vec.push(f);
-    }
-
-    futures::future::join_all(futures_vec).await;
 }
 
 #[tokio::main]
@@ -306,13 +313,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         SubCommands::Generate(gen) => {
             generate_config(opts.config_file, &gen).await?;
         }
-        SubCommands::Run(_) => {
+        SubCommands::Run(run) => {
             let c_serial = tokio::fs::read_to_string(opts.config_file).await?;
             let c: Config = serde_yaml::from_str(c_serial.as_str())?;
 
             info!("running with {} miners", c.devices.len());
 
-            start_miners(c.devices).await;
+            start_miners(c.devices, run.pool).await;
         }
     }
 
