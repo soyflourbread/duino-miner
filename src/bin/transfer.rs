@@ -26,7 +26,7 @@ struct Account {
 #[clap(version = "0.1", author = "Black H. <encomblackhat@gmail.com>")]
 #[clap(setting = AppSettings::ColoredHelp)]
 struct Opts {
-    #[clap(short, long, default_value = "transfer.yaml")]
+    #[clap(short, long, default_value = "accounts.yaml")]
     config_file: String,
     #[clap(short)]
     force: bool,
@@ -70,7 +70,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let balance = balance as u32;
 
-        if balance > 100 || opts.force {
+        if balance > 100 || (opts.force && balance > 0) {
             let cmd_job = format!("SEND,-,{},{}\n", c.main_account, balance);
             stream.write(cmd_job.as_bytes()).await.map_err(|_| MinerError::SendCommand)?;
             let n = stream.read(&mut cmd_in).await.map_err(|_| MinerError::RecvCommand)?;

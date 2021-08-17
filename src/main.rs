@@ -1,19 +1,27 @@
 use duino_miner::error::MinerError;
 
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
-use std::time::{SystemTime, Duration};
+use std::time::{Duration, SystemTime};
 
-use tokio::net::TcpStream;
-use tokio::io::{AsyncWriteExt, AsyncReadExt};
 use tokio::fs::File;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 
-use log::{info, warn, error};
+use log::{error, info, warn};
 
-use sha1::{Sha1, Digest};
 use rand::Rng;
+use sha1::{Digest, Sha1};
 
 use clap::{AppSettings, Clap, Subcommand};
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Pool {
+    pub name: String,
+    pub ip: String,
+    pub port: u16,
+    pub connections: u32,
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Config {
@@ -22,8 +30,6 @@ pub struct Config {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Device {
-    pub host: String,
-    pub port: u16,
     pub username: String,
     pub device_name: String,
     pub device_type: String,
@@ -31,7 +37,6 @@ pub struct Device {
     pub firmware: String,
     pub target_rate: u32,
 }
-
 
 #[derive(Clap)]
 #[clap(version = "0.1", author = "Black H. <encomblackhat@gmail.com>")]
@@ -52,10 +57,6 @@ enum SubCommands {
 
 #[derive(Clap)]
 struct Generate {
-    #[clap(short, long, default_value = "149.91.88.18")]
-    host: String,
-    #[clap(short, long, default_value = "6000")]
-    port: u16,
     #[clap(short, long, default_value = "my_username")]
     username: String,
     #[clap(long, default_value = "16")]
@@ -73,9 +74,10 @@ struct Generate {
 #[derive(Clap)]
 struct Run {}
 
-
 fn generate_8hex() -> String {
-    const HEX_ARRAY: [char; 16] = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f'];
+    const HEX_ARRAY: [char; 16] = [
+        '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f',
+    ];
 
     let mut result = String::new();
 
@@ -87,13 +89,14 @@ fn generate_8hex() -> String {
     result
 }
 
-async fn generate_config(file_path: String, gen: &Generate) -> Result<(), Box<dyn std::error::Error>> {
+async fn generate_config(
+    file_path: String,
+    gen: &Generate,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut device_vec: Vec<Device> = Vec::new();
 
     for i in 0..gen.device_count {
         let device = Device {
-            host: gen.host.clone(),
-            port: gen.port,
             username: gen.username.clone(),
             device_name: format!("{}{}", gen.device_name_prefix, i + 1),
             device_type: gen.device_type.clone(),
@@ -105,7 +108,9 @@ async fn generate_config(file_path: String, gen: &Generate) -> Result<(), Box<dy
         device_vec.push(device);
     }
 
-    let c = Config { devices: device_vec };
+    let c = Config {
+        devices: device_vec,
+    };
     let c_serial = serde_yaml::to_string(&c)?;
 
     let mut f = File::create(file_path).await?;
@@ -122,24 +127,55 @@ fn sha1_digest(input: &str) -> String {
     format!("{:x}", h)
 }
 
-async fn start_miner(device: Device) -> Result<(), MinerError> {
-    let mut stream = TcpStream::connect(
-        format!("{}:{}", device.host, device.port)).await.map_err(|_| MinerError::Connection)?;
+async fn get_pool_info() -> Result<Pool, MinerError> {
+    let pool: Pool = reqwest::get("http://51.15.127.80:4242/getPool")
+        .await
+        .map_err(|_| MinerError::Connection)?
+        .json()
+        .await
+        .map_err(|_| MinerError::Connection)?;
 
-    info!("{} connected to pool {}:{}", device.device_name, device.host, device.port);
+    Ok(pool)
+}
+
+async fn start_miner(device: Device) -> Result<(), MinerError> {
+    let pool = get_pool_info().await?;
+
+    let mut stream = TcpStream::connect(format!("{}:{}", pool.ip, pool.port))
+        .await
+        .map_err(|_| MinerError::Connection)?;
+
+    info!(
+        "{} connected to pool {}:{}",
+        device.device_name, pool.ip, pool.port
+    );
 
     let mut cmd_in: [u8; 200] = [0; 200];
-    let n = stream.read(&mut cmd_in).await.map_err(|_| MinerError::RecvCommand)?;
-    info!("version: {}", std::str::from_utf8(&cmd_in[..n]).map_err(|_| MinerError::InvalidUTF8)?);
+    let n = stream
+        .read(&mut cmd_in)
+        .await
+        .map_err(|_| MinerError::RecvCommand)?;
+    info!(
+        "version: {}",
+        std::str::from_utf8(&cmd_in[..n]).map_err(|_| MinerError::InvalidUTF8)?
+    );
 
     let expected_interval = 1000000u128 / device.target_rate as u128;
 
     loop {
         let cmd_job = format!("JOB,{},{}\n", device.username, device.device_type);
-        stream.write(cmd_job.as_bytes()).await.map_err(|_| MinerError::SendCommand)?;
+        stream
+            .write(cmd_job.as_bytes())
+            .await
+            .map_err(|_| MinerError::SendCommand)?;
 
-        let n = stream.read(&mut cmd_in).await.map_err(|_| MinerError::RecvCommand)?;
-        let job = std::str::from_utf8(&cmd_in[..n]).map_err(|_| MinerError::InvalidUTF8)?.trim();
+        let n = stream
+            .read(&mut cmd_in)
+            .await
+            .map_err(|_| MinerError::RecvCommand)?;
+        let job = std::str::from_utf8(&cmd_in[..n])
+            .map_err(|_| MinerError::InvalidUTF8)?
+            .trim();
 
         let args: Vec<&str> = job.split(',').collect();
         if args.len() < 3 {
@@ -148,9 +184,16 @@ async fn start_miner(device: Device) -> Result<(), MinerError> {
 
         let last_block_hash = args[0];
         let expected_hash = args[1];
-        let diff = args[2].parse::<u32>().map_err(|_| MinerError::MalformedJob(job.to_string()))? * 100 + 1;
+        let diff = args[2]
+            .parse::<u32>()
+            .map_err(|_| MinerError::MalformedJob(job.to_string()))?
+            * 100
+            + 1;
 
-        info!("last: {}, expected: {}, diff: {}", last_block_hash, expected_hash, diff);
+        info!(
+            "last: {}, expected: {}, diff: {}",
+            last_block_hash, expected_hash, diff
+        );
 
         let start = SystemTime::now();
 
@@ -170,7 +213,10 @@ async fn start_miner(device: Device) -> Result<(), MinerError> {
                     tokio::time::sleep(Duration::from_micros(wait_duration)).await;
                     info!("waited {} micro sec", wait_duration);
                 } else {
-                    warn!("system too slow, lag {} micro sec", duration - expected_duration);
+                    warn!(
+                        "system too slow, lag {} micro sec",
+                        duration - expected_duration
+                    );
                 }
 
                 let end = SystemTime::now();
@@ -180,22 +226,42 @@ async fn start_miner(device: Device) -> Result<(), MinerError> {
                 let lag_duration: u64 = rand::thread_rng().gen_range(0..100);
                 tokio::time::sleep(Duration::from_millis(lag_duration)).await;
 
-                let cmd_out = format!("{},{:.2},{},{},{}\n",
-                                      duco_numeric_result, emu_rate, device.firmware, device.device_name, device.chip_id);
-                stream.write(cmd_out.as_bytes()).await.map_err(|_| MinerError::SendCommand)?;
+                let cmd_out = format!(
+                    "{},{:.2},{},{},{}\n",
+                    duco_numeric_result,
+                    emu_rate,
+                    device.firmware,
+                    device.device_name,
+                    device.chip_id
+                );
+                stream
+                    .write(cmd_out.as_bytes())
+                    .await
+                    .map_err(|_| MinerError::SendCommand)?;
 
-                let n = stream.read(&mut cmd_in).await.map_err(|_| MinerError::RecvCommand)?;
-                let resp = std::str::from_utf8(&cmd_in[..n]).map_err(|_| MinerError::InvalidUTF8)?.trim();
+                let n = stream
+                    .read(&mut cmd_in)
+                    .await
+                    .map_err(|_| MinerError::RecvCommand)?;
+                let resp = std::str::from_utf8(&cmd_in[..n])
+                    .map_err(|_| MinerError::InvalidUTF8)?
+                    .trim();
 
                 if resp == "GOOD" {
-                    info!("result good, result: {}, rate: {:.2}, real: {:.2}",
-                          duco_numeric_result, emu_rate, real_rate);
+                    info!(
+                        "result good, result: {}, rate: {:.2}, real: {:.2}",
+                        duco_numeric_result, emu_rate, real_rate
+                    );
                 } else if resp == "BLOCK" {
-                    info!("FOUND BLOCK!, result: {}, rate: {:.2}, real: {:.2}",
-                             duco_numeric_result, emu_rate, real_rate);
+                    info!(
+                        "FOUND BLOCK!, result: {}, rate: {:.2}, real: {:.2}",
+                        duco_numeric_result, emu_rate, real_rate
+                    );
                 } else {
-                    warn!("resp: {}, result: {}, rate: {:.2}, real: {:.2}",
-                             resp, duco_numeric_result, emu_rate, real_rate);
+                    warn!(
+                        "resp: {}, result: {}, rate: {:.2}, real: {:.2}",
+                        resp, duco_numeric_result, emu_rate, real_rate
+                    );
                 }
 
                 break;
