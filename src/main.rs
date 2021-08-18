@@ -1,4 +1,9 @@
+mod hasher;
+mod util;
+
 use duino_miner::error::MinerError;
+
+use crate::util::{generate_8hex, get_pool_info};
 
 use serde::{Deserialize, Serialize};
 
@@ -8,20 +13,12 @@ use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
+use rand::Rng;
+
 use log::{error, info, warn};
 
-use rand::Rng;
-use sha1::{Digest, Sha1};
-
+use crate::hasher::Sha1Hasher;
 use clap::{AppSettings, Clap, Subcommand};
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Pool {
-    pub name: String,
-    pub ip: String,
-    pub port: u16,
-    pub connections: u32,
-}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Config {
@@ -77,21 +74,6 @@ struct Run {
     pool: Option<String>,
 }
 
-fn generate_8hex() -> String {
-    const HEX_ARRAY: [char; 16] = [
-        '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f',
-    ];
-
-    let mut result = String::new();
-
-    for _ in 0..8 {
-        let n: usize = rand::thread_rng().gen_range(0..16);
-        result.push(HEX_ARRAY[n]);
-    }
-
-    result
-}
-
 async fn generate_config(
     file_path: String,
     gen: &Generate,
@@ -122,26 +104,7 @@ async fn generate_config(
     Ok(())
 }
 
-fn sha1_digest(input: &str) -> String {
-    let mut hasher = Sha1::new();
-    sha1::Digest::update(&mut hasher, input.as_bytes());
-
-    let h = hasher.finalize();
-    format!("{:x}", h)
-}
-
-async fn get_pool_info() -> Result<Pool, MinerError> {
-    let pool: Pool = reqwest::get("http://51.15.127.80:4242/getPool")
-        .await
-        .map_err(|_| MinerError::Connection)?
-        .json()
-        .await
-        .map_err(|_| MinerError::Connection)?;
-
-    Ok(pool)
-}
-
-async fn start_miner(device: Device, pool: String) -> Result<(), MinerError> {
+async fn start_miner(device: Device, pool: String, hasher: Sha1Hasher) -> Result<(), MinerError> {
     let heatup_duration: u64 = rand::thread_rng().gen_range(10..10000);
     tokio::time::sleep(Duration::from_millis(heatup_duration)).await;
 
@@ -198,98 +161,84 @@ async fn start_miner(device: Device, pool: String) -> Result<(), MinerError> {
 
         let start = SystemTime::now();
 
-        for duco_numeric_result in 0..diff {
-            let h = format!("{}{}", last_block_hash, duco_numeric_result);
-            let result = sha1_digest(h.as_str());
+        let duco_numeric_result = hasher
+            .get_hash(last_block_hash.to_string(), expected_hash.to_string(), diff)
+            .await;
 
-            if result == expected_hash {
-                let end = SystemTime::now();
-                let duration = end.duration_since(start).unwrap().as_micros();
-                let real_rate = duco_numeric_result as f64 / duration as f64 * 1000000f64;
+        let end = SystemTime::now();
+        let duration = end.duration_since(start).unwrap().as_micros();
+        let real_rate = duco_numeric_result as f64 / duration as f64 * 1000000f64;
 
-                let expected_duration = expected_interval * duco_numeric_result as u128;
+        let expected_duration = expected_interval * duco_numeric_result as u128;
 
-                if duration < expected_duration {
-                    let wait_duration = (expected_duration - duration) as u64;
-                    tokio::time::sleep(Duration::from_micros(wait_duration)).await;
-                    info!("waited {} micro sec", wait_duration);
-                } else {
-                    warn!(
-                        "system too slow, lag {} micro sec",
-                        duration - expected_duration
-                    );
-                }
+        if duration < expected_duration {
+            let wait_duration = (expected_duration - duration) as u64;
+            tokio::time::sleep(Duration::from_micros(wait_duration)).await;
+            info!("waited {} micro sec", wait_duration);
+        } else {
+            warn!(
+                "system too slow, lag {} micro sec",
+                duration - expected_duration
+            );
+        }
 
-                let end = SystemTime::now();
-                let duration = end.duration_since(start).unwrap().as_micros();
-                let emu_rate = duco_numeric_result as f64 / duration as f64 * 1000000f64;
+        let end = SystemTime::now();
+        let duration = end.duration_since(start).unwrap().as_micros();
+        let emu_rate = duco_numeric_result as f64 / duration as f64 * 1000000f64;
 
-                let lag_duration: u64 = rand::thread_rng().gen_range(0..100);
-                tokio::time::sleep(Duration::from_millis(lag_duration)).await;
+        let lag_duration: u64 = rand::thread_rng().gen_range(0..100);
+        tokio::time::sleep(Duration::from_millis(lag_duration)).await;
 
-                let cmd_out = format!(
-                    "{},{:.2},{},{},{}\n",
-                    duco_numeric_result,
-                    emu_rate,
-                    device.firmware,
-                    device.device_name,
-                    device.chip_id
-                );
-                stream
-                    .write(cmd_out.as_bytes())
-                    .await
-                    .map_err(|_| MinerError::SendCommand)?;
+        let cmd_out = format!(
+            "{},{:.2},{},{},{}\n",
+            duco_numeric_result, emu_rate, device.firmware, device.device_name, device.chip_id
+        );
+        stream
+            .write(cmd_out.as_bytes())
+            .await
+            .map_err(|_| MinerError::SendCommand)?;
 
-                let n = stream
-                    .read(&mut cmd_in)
-                    .await
-                    .map_err(|_| MinerError::RecvCommand)?;
-                let resp = std::str::from_utf8(&cmd_in[..n])
-                    .map_err(|_| MinerError::InvalidUTF8)?
-                    .trim();
+        let n = stream
+            .read(&mut cmd_in)
+            .await
+            .map_err(|_| MinerError::RecvCommand)?;
+        let resp = std::str::from_utf8(&cmd_in[..n])
+            .map_err(|_| MinerError::InvalidUTF8)?
+            .trim();
 
-                if resp == "GOOD" {
-                    info!(
-                        "result good, result: {}, rate: {:.2}, real: {:.2}",
-                        duco_numeric_result, emu_rate, real_rate
-                    );
-                } else if resp == "BLOCK" {
-                    info!(
-                        "FOUND BLOCK!, result: {}, rate: {:.2}, real: {:.2}",
-                        duco_numeric_result, emu_rate, real_rate
-                    );
-                } else {
-                    warn!(
-                        "resp: {}, result: {}, rate: {:.2}, real: {:.2}",
-                        resp, duco_numeric_result, emu_rate, real_rate
-                    );
-                }
-
-                break;
-            }
+        if resp == "GOOD" {
+            info!(
+                "result good, result: {}, rate: {:.2}, real: {:.2}",
+                duco_numeric_result, emu_rate, real_rate
+            );
+        } else if resp == "BLOCK" {
+            info!(
+                "FOUND BLOCK!, result: {}, rate: {:.2}, real: {:.2}",
+                duco_numeric_result, emu_rate, real_rate
+            );
+        } else {
+            warn!(
+                "resp: {}, result: {}, rate: {:.2}, real: {:.2}",
+                resp, duco_numeric_result, emu_rate, real_rate
+            );
         }
     }
 }
 
-async fn start_miners(devices: Vec<Device>, pool: Option<String>) {
+async fn start_miners(devices: Vec<Device>, pool: Option<String>, hasher: Sha1Hasher) {
     loop {
         let pool = if let Some(pool) = pool.clone() {
             pool
         } else {
-            let pool = get_pool_info().await.unwrap_or(Pool {
-                name: "Default pool".to_string(),
-                ip: "server.duinocoin.com".to_string(),
-                port: 2813,
-                connections: 1,
-            });
-
-            format!("{}:{}", pool.ip, pool.port)
+            get_pool_info()
+                .await
+                .unwrap_or(format!("{}:{}", "server.duinocoin.com", 2813))
         };
 
         let mut futures_vec = Vec::new();
 
         for device in &devices {
-            let f = start_miner(device.clone(), pool.clone());
+            let f = start_miner(device.clone(), pool.clone(), hasher.clone());
             futures_vec.push(f);
         }
 
@@ -316,7 +265,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             info!("running with {} miners", c.devices.len());
 
-            start_miners(c.devices, run.pool).await;
+            let hasher = Sha1Hasher::new();
+            start_miners(c.devices, run.pool, hasher).await;
         }
     }
 
