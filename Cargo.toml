@@ -13,6 +13,7 @@ sha-1 = { version = "0.9", features = ["asm"] }
 data-encoding = "2.3"
 rand = "0.8"
 parity-wordlist = "1"
+hex = "0.4"
 
 tokio = { version = "1.9", features = ["full"] }
 futures = "0.3"

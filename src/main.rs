@@ -161,9 +161,7 @@ async fn start_miner(device: Device, pool: String, hasher: Sha1Hasher) -> Result
 
         let start = SystemTime::now();
 
-        let duco_numeric_result = hasher
-            .get_hash(last_block_hash.to_string(), expected_hash.to_string(), diff)
-            .await;
+        let duco_numeric_result = hasher.get_hash(last_block_hash, expected_hash, diff).await;
 
         let end = SystemTime::now();
         let duration = end.duration_since(start).unwrap().as_micros();
