@@ -297,9 +297,6 @@ async fn start_miners(devices: Vec<Device>, pool: Option<String>) {
             Ok(_) => error!("exited without error"),
             Err(e) => error!("exited with error: {:?}", e),
         }
-
-        let hiatus_duration: u64 = rand::thread_rng().gen_range(30..200);
-        tokio::time::sleep(Duration::from_secs(hiatus_duration)).await;
     }
 }
 
