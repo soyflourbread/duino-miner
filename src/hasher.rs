@@ -1,3 +1,5 @@
+use duino_miner::error::MinerError;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -8,8 +10,8 @@ use sha1::{Digest, Sha1};
 
 type BlockHash = [u8; 20];
 
-fn to_block_hash(s: &str) -> BlockHash {
-    <BlockHash>::from_hex(s).unwrap_or_else(|_| panic!("{} is not hex string.", s))
+fn to_block_hash(s: &str) -> Result<BlockHash, MinerError> {
+    <BlockHash>::from_hex(s).map_err(|_| MinerError::MalformedJob(format!("Non hex string: {}", s)))
 }
 
 #[derive(Clone)]
@@ -28,16 +30,21 @@ impl Sha1Hasher {
         }
     }
 
-    pub async fn get_hash(&self, last_block_hash: &str, expected_hash: &str, diff: u32) -> u32 {
-        let last_block_hash = to_block_hash(last_block_hash);
-        let expected_hash = to_block_hash(expected_hash);
+    pub async fn get_hash(
+        &self,
+        last_block_hash: &str,
+        expected_hash: &str,
+        diff: u32,
+    ) -> Result<u32, MinerError> {
+        let last_block_hash = to_block_hash(last_block_hash)?;
+        let expected_hash = to_block_hash(expected_hash)?;
 
         let mut hashmap = self.hashmap.lock().await;
         if let Some(hashes) = hashmap.get_mut(&last_block_hash) {
             // Optimized for lower difficulty, uses AVX.
             for (duco_numeric_result, hash) in hashes.iter().enumerate() {
                 if hash == &expected_hash {
-                    return duco_numeric_result as u32;
+                    return Ok(duco_numeric_result as u32);
                 }
             }
 
@@ -45,12 +52,13 @@ impl Sha1Hasher {
             if current_progress < diff {
                 log::info!("Continuing calculation.");
 
+                let hasher = self.precompute_sha1(&last_block_hash);
                 for duco_numeric_result in current_progress..diff {
-                    let hash = self.hash_next_block(&last_block_hash, duco_numeric_result);
+                    let hash = self.next_compute_numeric(hasher.clone(), duco_numeric_result);
                     hashes.push(hash);
 
                     if hash == expected_hash {
-                        return duco_numeric_result as u32;
+                        return Ok(duco_numeric_result);
                     }
                 }
             }
@@ -68,31 +76,39 @@ impl Sha1Hasher {
         }
 
         let mut hashes: Vec<BlockHash> = Vec::with_capacity(diff as usize);
+        let hasher = self.precompute_sha1(&last_block_hash);
         for duco_numeric_result in 0..diff {
-            let hash = self.hash_next_block(&last_block_hash, duco_numeric_result);
+            let hash = self.next_compute_numeric(hasher.clone(), duco_numeric_result);
             hashes.push(hash);
 
             if hash == expected_hash {
                 hashmap.insert(last_block_hash, hashes);
                 stack.push(last_block_hash);
 
-                return duco_numeric_result;
+                return Ok(duco_numeric_result);
             }
         }
 
         hashmap.insert(last_block_hash, hashes);
         stack.push(last_block_hash);
 
-        0
+        Err(MinerError::MalformedJob(
+            "Job impossible to solve.".to_string(),
+        ))
     }
 
-    fn hash_next_block(&self, last_block_hash: &BlockHash, duco_numeric_result: u32) -> BlockHash {
+    fn precompute_sha1(&self, last_block_hash: &BlockHash) -> Sha1 {
         let mut hasher = Sha1::new();
 
         let mut encode_slice: [u8; 40] = [0; 40];
         hex::encode_to_slice(&last_block_hash, &mut encode_slice).unwrap();
 
         sha1::Digest::update(&mut hasher, &encode_slice);
+
+        hasher
+    }
+
+    fn next_compute_numeric(&self, mut hasher: Sha1, duco_numeric_result: u32) -> BlockHash {
         sha1::Digest::update(&mut hasher, duco_numeric_result.to_string().as_bytes());
         let h = hasher.finalize();
 
