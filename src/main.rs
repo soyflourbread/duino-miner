@@ -3,21 +3,20 @@ mod util;
 
 use duino_miner::error::MinerError;
 
+use crate::hasher::Sha1Hasher;
 use crate::util::{generate_8hex, get_pool_info};
 
 use serde::{Deserialize, Serialize};
 
+use std::fs::File;
+use std::io::{Read, Write};
+use std::net::TcpStream;
 use std::time::{Duration, SystemTime};
-
-use tokio::fs::File;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 
 use rand::Rng;
 
 use log::{error, info, warn};
 
-use crate::hasher::Sha1Hasher;
 use clap::{AppSettings, Clap, Subcommand};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -74,10 +73,7 @@ struct Run {
     pool: Option<String>,
 }
 
-async fn generate_config(
-    file_path: String,
-    gen: &Generate,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn generate_config(file_path: String, gen: &Generate) -> Result<(), Box<dyn std::error::Error>> {
     let mut device_vec: Vec<Device> = Vec::new();
 
     for i in 0..gen.device_count {
@@ -98,26 +94,23 @@ async fn generate_config(
     };
     let c_serial = serde_yaml::to_string(&c)?;
 
-    let mut f = File::create(file_path).await?;
-    f.write_all(c_serial.as_bytes()).await?;
+    let mut f = File::create(file_path)?;
+    f.write_all(c_serial.as_bytes())?;
 
     Ok(())
 }
 
-async fn start_miner(device: Device, pool: String, hasher: Sha1Hasher) -> Result<(), MinerError> {
+fn start_miner(device: Device, pool: String, hasher: Sha1Hasher) -> Result<(), MinerError> {
     let heatup_duration: u64 = rand::thread_rng().gen_range(10..10000);
-    tokio::time::sleep(Duration::from_millis(heatup_duration)).await;
+    std::thread::sleep(Duration::from_millis(heatup_duration));
 
-    let mut stream = TcpStream::connect(&pool)
-        .await
-        .map_err(|_| MinerError::Connection)?;
+    let mut stream = TcpStream::connect(&pool).map_err(|_| MinerError::Connection)?;
 
     info!("{} connected to pool {}", device.device_name, pool);
 
     let mut cmd_in: [u8; 200] = [0; 200];
     let n = stream
         .read(&mut cmd_in)
-        .await
         .map_err(|_| MinerError::RecvCommand)?;
     info!(
         "version: {}",
@@ -130,12 +123,10 @@ async fn start_miner(device: Device, pool: String, hasher: Sha1Hasher) -> Result
         let cmd_job = format!("JOB,{},{}\n", device.username, device.device_type);
         stream
             .write(cmd_job.as_bytes())
-            .await
             .map_err(|_| MinerError::SendCommand)?;
 
         let n = stream
             .read(&mut cmd_in)
-            .await
             .map_err(|_| MinerError::RecvCommand)?;
         let job = std::str::from_utf8(&cmd_in[..n])
             .map_err(|_| MinerError::InvalidUTF8)?
@@ -163,7 +154,6 @@ async fn start_miner(device: Device, pool: String, hasher: Sha1Hasher) -> Result
 
         let duco_numeric_result = hasher
             .get_hash(last_block_hash, expected_hash, diff)
-            .await
             .unwrap_or(0);
 
         let end = SystemTime::now();
@@ -174,7 +164,7 @@ async fn start_miner(device: Device, pool: String, hasher: Sha1Hasher) -> Result
 
         if duration < expected_duration {
             let wait_duration = (expected_duration - duration) as u64;
-            tokio::time::sleep(Duration::from_micros(wait_duration)).await;
+            std::thread::sleep(Duration::from_micros(wait_duration));
             info!("waited {} micro sec", wait_duration);
         } else {
             warn!(
@@ -187,8 +177,8 @@ async fn start_miner(device: Device, pool: String, hasher: Sha1Hasher) -> Result
         let duration = end.duration_since(start).unwrap().as_micros();
         let emu_rate = duco_numeric_result as f64 / duration as f64 * 1000000f64;
 
-        let lag_duration: u64 = rand::thread_rng().gen_range(0..100);
-        tokio::time::sleep(Duration::from_millis(lag_duration)).await;
+        // let lag_duration: u64 = rand::thread_rng().gen_range(0..100);
+        // tokio::time::sleep(Duration::from_millis(lag_duration)).await;
 
         let cmd_out = format!(
             "{},{:.2},{},{},{}\n",
@@ -196,12 +186,10 @@ async fn start_miner(device: Device, pool: String, hasher: Sha1Hasher) -> Result
         );
         stream
             .write(cmd_out.as_bytes())
-            .await
             .map_err(|_| MinerError::SendCommand)?;
 
         let n = stream
             .read(&mut cmd_in)
-            .await
             .map_err(|_| MinerError::RecvCommand)?;
         let resp = std::str::from_utf8(&cmd_in[..n])
             .map_err(|_| MinerError::InvalidUTF8)?
@@ -226,48 +214,58 @@ async fn start_miner(device: Device, pool: String, hasher: Sha1Hasher) -> Result
     }
 }
 
-async fn start_miners(devices: Vec<Device>, pool: Option<String>, hasher: Sha1Hasher) {
+fn start_miner_loop(device: Device, pool: Option<String>, hasher: Sha1Hasher) {
+    info!("Spawning {}...", device.device_name);
+
     loop {
         let pool = if let Some(pool) = pool.clone() {
             pool
         } else {
-            get_pool_info()
-                .await
-                .unwrap_or(format!("{}:{}", "server.duinocoin.com", 2813))
+            get_pool_info().unwrap_or(format!("{}:{}", "server.duinocoin.com", 2813))
         };
 
-        let mut futures_vec = Vec::new();
-
-        for device in &devices {
-            let f = start_miner(device.clone(), pool.clone(), hasher.clone());
-            futures_vec.push(f);
-        }
-
-        match futures::future::try_join_all(futures_vec).await {
+        match start_miner(device.clone(), pool, hasher.clone()) {
             Ok(_) => error!("exited without error"),
             Err(e) => error!("exited with error: {:?}", e),
         }
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn start_miners(devices: Vec<Device>, pool: Option<String>, hasher: Sha1Hasher) {
+    let mut handles = vec![];
+
+    for device in devices {
+        let hasher = hasher.clone();
+        let pool = pool.clone();
+
+        let handle = std::thread::spawn(move || {
+            start_miner_loop(device, pool, hasher);
+        });
+        handles.push(handle);
+    }
+
+    for handle in handles {
+        handle.join().unwrap();
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     pretty_env_logger::init();
 
     let opts: Opts = Opts::parse();
 
     match opts.sub_command {
         SubCommands::Generate(gen) => {
-            generate_config(opts.config_file, &gen).await?;
+            generate_config(opts.config_file, &gen)?;
         }
         SubCommands::Run(run) => {
-            let c_serial = tokio::fs::read_to_string(opts.config_file).await?;
+            let c_serial = std::fs::read_to_string(opts.config_file)?;
             let c: Config = serde_yaml::from_str(c_serial.as_str())?;
 
             info!("running with {} miners", c.devices.len());
 
             let hasher = Sha1Hasher::new();
-            start_miners(c.devices, run.pool, hasher).await;
+            start_miners(c.devices, run.pool, hasher);
         }
     }
 

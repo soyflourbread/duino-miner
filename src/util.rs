@@ -19,7 +19,7 @@ pub fn generate_8hex() -> String {
     result
 }
 
-pub async fn get_pool_info() -> Result<String, MinerError> {
+pub fn get_pool_info() -> Result<String, MinerError> {
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     struct Pool {
         pub name: String,
@@ -28,11 +28,10 @@ pub async fn get_pool_info() -> Result<String, MinerError> {
         pub connections: u32,
     }
 
-    let pool: Pool = reqwest::get("http://51.15.127.80:4242/getPool")
-        .await
+    let pool: Pool = ureq::get("http://51.15.127.80:4242/getPool")
+        .call()
         .map_err(|_| MinerError::Connection)?
-        .json()
-        .await
+        .into_json()
         .map_err(|_| MinerError::Connection)?;
 
     Ok(format!("{}:{}", pool.ip, pool.port))

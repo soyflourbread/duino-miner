@@ -1,15 +1,14 @@
 use duino_miner::error::MinerError;
 
+use serde::{Deserialize, Serialize};
+
+use std::fs::File;
+use std::io::{Read, Write};
+use std::net::TcpStream;
 use std::time::Duration;
 
-use serde::{Serialize, Deserialize};
-
-use rand::{thread_rng, Rng};
 use rand::distributions::Alphanumeric;
-
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
-use tokio::fs::File;
+use rand::{thread_rng, Rng};
 
 use clap::{AppSettings, Clap};
 
@@ -42,11 +41,10 @@ struct Opts {
     config_file: String,
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let opts: Opts = Opts::parse();
 
-    let c_serial = tokio::fs::read_to_string(opts.config_file.clone()).await?;
+    let c_serial = std::fs::read_to_string(opts.config_file.clone())?;
     let mut c: Config = serde_yaml::from_str(c_serial.as_str())?;
 
     for _ in 0..opts.count {
@@ -58,19 +56,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map(char::from)
             .collect();
 
-        let mut stream = TcpStream::connect(
-            format!("{}:{}", opts.host, opts.port)).await.map_err(|_| MinerError::Connection)?;
+        let mut stream = TcpStream::connect(format!("{}:{}", opts.host, opts.port))
+            .map_err(|_| MinerError::Connection)?;
 
         println!("Connected to pool {}:{}", opts.host, opts.port);
 
         let mut cmd_in: [u8; 200] = [0; 200];
 
-        let n = stream.read(&mut cmd_in).await.map_err(|_| MinerError::RecvCommand)?;
+        let n = stream
+            .read(&mut cmd_in)
+            .map_err(|_| MinerError::RecvCommand)?;
         println!("version: {}", std::str::from_utf8(&cmd_in[..n])?);
 
         let cmd_job = format!("REGI,{},{},{}@gmail.com\n", username, password, username);
-        stream.write(cmd_job.as_bytes()).await.map_err(|_| MinerError::SendCommand)?;
-        let n = stream.read(&mut cmd_in).await.map_err(|_| MinerError::RecvCommand)?;
+        stream
+            .write(cmd_job.as_bytes())
+            .map_err(|_| MinerError::SendCommand)?;
+        let n = stream
+            .read(&mut cmd_in)
+            .map_err(|_| MinerError::RecvCommand)?;
         let reg_status = std::str::from_utf8(&cmd_in[..n]).map_err(|_| MinerError::InvalidUTF8)?;
 
         if reg_status != "OK" {
@@ -83,10 +87,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         c.accounts.push(Account { username, password });
         let c_serial = serde_yaml::to_string(&c)?;
 
-        let mut f = File::create(opts.config_file.clone()).await?;
-        f.write_all(c_serial.as_bytes()).await?;
+        let mut f = File::create(opts.config_file.clone())?;
+        f.write_all(c_serial.as_bytes())?;
 
-        tokio::time::sleep(Duration::from_secs(4)).await;
+        std::thread::sleep(Duration::from_secs(4));
     }
 
     Ok(())
